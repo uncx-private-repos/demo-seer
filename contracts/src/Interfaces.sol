@@ -1,19 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-interface IERC20 {
-    function symbol() external view returns (string memory);
-
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-
-    function transfer(address to, uint256 amount) external returns (bool);
-
-    function approve(address spender, uint256 amount) external returns (bool);
-
-    function balanceOf(address owner) external returns (uint256);
-
-    function totalSupply() external view returns (uint256);
-}
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 // https://github.com/RealityETH/reality-eth-monorepo/blob/main/packages/contracts/flat/RealityETH-3.0.sol
 interface IRealityETH_v3_0 {
@@ -27,23 +15,65 @@ interface IRealityETH_v3_0 {
         uint256 min_bond
     ) external payable returns (bytes32);
 
-    function resultForOnceSettled(bytes32 question_id) external view returns (bytes32);
+    function resultForOnceSettled(
+        bytes32 question_id
+    ) external view returns (bytes32);
 
-    function getContentHash(bytes32 question_id) external view returns (bytes32);
+    function getContentHash(
+        bytes32 question_id
+    ) external view returns (bytes32);
 
     function getTimeout(bytes32 question_id) external view returns (uint32);
 
-    function submitAnswer(bytes32 question_id, bytes32 answer, uint256 max_previous) external payable;
+    function submitAnswer(
+        bytes32 question_id,
+        bytes32 answer,
+        uint256 max_previous
+    ) external payable;
+
+    function isFinalized(bytes32 question_id) external view returns (bool);
+
+    function getFinalAnswer(
+        bytes32 question_id
+    ) external view returns (bytes32);
+
+    function getBond(bytes32 question_id) external view returns (uint256);
+
+    function getMinBond(bytes32 question_id) external view returns (uint256);
+
+    function getBestAnswer(bytes32 question_id) external view returns (bytes32);
+
+    function getBounty(bytes32 question_id) external view returns (uint256);
+
+    function getFinalizeTS(bytes32 question_id) external view returns (uint32);
+
+    function isPendingArbitration(
+        bytes32 question_id
+    ) external view returns (bool);
+
+    function getOpeningTS(bytes32 question_id) external view returns (uint32);
 }
 
 interface IConditionalTokens {
-    function payoutNumerators(bytes32 conditionId, uint256 index) external view returns (uint256);
+    function payoutNumerators(
+        bytes32 conditionId,
+        uint256 index
+    ) external view returns (uint256);
 
-    function payoutDenominator(bytes32 conditionId) external view returns (uint256);
+    function payoutDenominator(
+        bytes32 conditionId
+    ) external view returns (uint256);
 
-    function prepareCondition(address oracle, bytes32 questionId, uint256 outcomeSlotCount) external;
+    function prepareCondition(
+        address oracle,
+        bytes32 questionId,
+        uint256 outcomeSlotCount
+    ) external;
 
-    function reportPayouts(bytes32 questionId, uint256[] calldata payouts) external;
+    function reportPayouts(
+        bytes32 questionId,
+        uint256[] calldata payouts
+    ) external;
 
     function splitPosition(
         /*IERC20*/
@@ -83,13 +113,35 @@ interface IConditionalTokens {
         uint256 indexSet
     ) external view returns (bytes32);
 
-    function getPositionId(address collateralToken, bytes32 collectionId) external pure returns (uint256);
+    function getPositionId(
+        address collateralToken,
+        bytes32 collectionId
+    ) external pure returns (uint256);
 
-    function getOutcomeSlotCount(bytes32 conditionId) external view returns (uint256);
+    function getOutcomeSlotCount(
+        bytes32 conditionId
+    ) external view returns (uint256);
 
-    function safeTransferFrom(address from, address to, uint256 id, uint256 value, bytes calldata data) external;
+    function safeTransferFrom(
+        address from,
+        address to,
+        uint256 id,
+        uint256 value,
+        bytes calldata data
+    ) external;
 
-    function balanceOf(address owner, uint256 id) external view returns (uint256);
+    function balanceOf(
+        address owner,
+        uint256 id
+    ) external view returns (uint256);
+
+    // ERC1155 approval functions
+    function setApprovalForAll(address operator, bool approved) external;
+
+    function isApprovedForAll(
+        address owner,
+        address operator
+    ) external view returns (bool);
 }
 
 interface IWrapped1155Factory {
@@ -97,8 +149,8 @@ interface IWrapped1155Factory {
         /*IERC1155*/
         address multiToken,
         uint256 tokenId,
-        bytes calldata data
-    ) external /*Wrapped1155*/ returns (IERC20);
+        bytes calldata data /*Wrapped1155*/
+    ) external returns (IERC20);
 
     function unwrap(
         /*IERC1155*/

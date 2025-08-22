@@ -11,6 +11,7 @@ pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+import {IConditionalTokens, IRealityETH_v3_0} from "./Interfaces.sol";
 
 /**
  * @title SimpleGrantManager
@@ -67,6 +68,21 @@ contract SimpleGrantManager {
         bytes32 indexed grantId,
         address indexed provider,
         uint256 amount
+    );
+
+    event GrantRedeemed(
+        bytes32 indexed grantId,
+        address indexed recipient,
+        uint256 yesTokensBurned,
+        uint256 collateralReceived
+    );
+
+    event AnswerSubmitted(
+        bytes32 indexed grantId,
+        bytes32 indexed questionId,
+        address indexed submitter,
+        bytes32 answer,
+        uint256 bond
     );
 
     /**
@@ -239,6 +255,11 @@ contract SimpleGrantManager {
         Grant storage grant = grants[grantId];
         require(grant.resolved, "Grant not yet resolved");
 
+        // Check the answer from Reality.eth (can redeem even if failed, will get 0 payout)
+        uint256 answer = uint256(
+            realitio.resultForOnceSettled(grant.questionId)
+        );
+
         bytes32 yesCollectionId = conditionalTokens.getCollectionId(
             bytes32(0),
             grant.conditionId,
@@ -256,7 +277,31 @@ contract SimpleGrantManager {
         );
         require(balance > 0, "No YES tokens to redeem");
 
-        // Redeem positions
+        // Store balance before for event/calculations
+        uint256 collateralBefore = grant.collateralToken.balanceOf(msg.sender);
+
+        // Check if this contract is approved to transfer the user's tokens
+        bool isApproved = conditionalTokens.isApprovedForAll(
+            msg.sender,
+            address(this)
+        );
+        if (!isApproved) {
+            // If not approved, the user needs to call setApprovalForAll first
+            revert(
+                "User must approve SimpleGrantManager to transfer YES tokens. Call conditionalTokens.setApprovalForAll(grantManagerAddress, true) first."
+            );
+        }
+
+        // Transfer YES tokens to this contract temporarily for redemption
+        conditionalTokens.safeTransferFrom(
+            msg.sender,
+            address(this),
+            yesPositionId,
+            balance,
+            ""
+        );
+
+        // Redeem positions - this burns the YES tokens and gives back collateral to this contract
         uint256[] memory indexSets = new uint256[](1);
         indexSets[0] = 1; // YES outcome
 
@@ -266,6 +311,23 @@ contract SimpleGrantManager {
             grant.conditionId,
             indexSets
         );
+
+        // Transfer the redeemed collateral to the user
+        uint256 contractCollateralBalance = grant.collateralToken.balanceOf(
+            address(this)
+        );
+        if (contractCollateralBalance > 0) {
+            grant.collateralToken.transfer(
+                msg.sender,
+                contractCollateralBalance
+            );
+        }
+
+        // Calculate how much collateral was received
+        uint256 collateralAfter = grant.collateralToken.balanceOf(msg.sender);
+        uint256 collateralReceived = collateralAfter - collateralBefore;
+
+        emit GrantRedeemed(grantId, msg.sender, balance, collateralReceived);
     }
 
     /**
@@ -276,11 +338,11 @@ contract SimpleGrantManager {
         Grant storage grant = grants[grantId];
         require(grant.resolved, "Grant not yet resolved");
 
-        // Check if grant failed (answer != 0)
+        // Check if grant failed (answer == 0, meaning NO)
         uint256 answer = uint256(
             realitio.resultForOnceSettled(grant.questionId)
         );
-        require(answer != 0, "Grant succeeded, cannot recover funds");
+        require(answer == 0, "Grant succeeded, cannot recover funds");
 
         bytes32 noCollectionId = conditionalTokens.getCollectionId(
             bytes32(0),
@@ -418,6 +480,200 @@ contract SimpleGrantManager {
      */
     function getGrant(bytes32 grantId) external view returns (Grant memory) {
         return grants[grantId];
+    }
+
+    // ========== REALITY.ETH INTERACTION FUNCTIONS ==========
+
+    /**
+     * @dev Submit an answer to a Reality.eth question for a grant
+     * @param grantId The grant ID
+     * @param answer The answer (0 for NO, 1 for YES)
+     * @param maxPrevious Maximum previous bond to prevent front-running
+     */
+    function submitAnswer(
+        bytes32 grantId,
+        uint256 answer,
+        uint256 maxPrevious
+    ) external payable {
+        Grant storage grant = grants[grantId];
+        require(grant.recipient != address(0), "Grant does not exist");
+        require(!grant.resolved, "Grant already resolved");
+
+        // Convert uint256 to bytes32 for Reality.eth
+        bytes32 answerBytes = bytes32(answer);
+
+        realitio.submitAnswer{value: msg.value}(
+            grant.questionId,
+            answerBytes,
+            maxPrevious
+        );
+
+        emit AnswerSubmitted(
+            grantId,
+            grant.questionId,
+            msg.sender,
+            answerBytes,
+            msg.value
+        );
+    }
+
+    /**
+     * @dev Check if a grant's question is finalized on Reality.eth
+     * @param grantId The grant ID
+     * @return True if the question is finalized
+     */
+    function isGrantQuestionFinalized(
+        bytes32 grantId
+    ) external view returns (bool) {
+        Grant storage grant = grants[grantId];
+        require(grant.recipient != address(0), "Grant does not exist");
+        return realitio.isFinalized(grant.questionId);
+    }
+
+    /**
+     * @dev Get the current bond for a grant's question
+     * @param grantId The grant ID
+     * @return The current bond amount
+     */
+    function getGrantQuestionBond(
+        bytes32 grantId
+    ) external view returns (uint256) {
+        Grant storage grant = grants[grantId];
+        require(grant.recipient != address(0), "Grant does not exist");
+        return realitio.getBond(grant.questionId);
+    }
+
+    /**
+     * @dev Get the minimum bond for a grant's question
+     * @param grantId The grant ID
+     * @return The minimum bond amount
+     */
+    function getGrantQuestionMinBond(
+        bytes32 grantId
+    ) external view returns (uint256) {
+        Grant storage grant = grants[grantId];
+        require(grant.recipient != address(0), "Grant does not exist");
+        return realitio.getMinBond(grant.questionId);
+    }
+
+    /**
+     * @dev Get the current best answer for a grant's question
+     * @param grantId The grant ID
+     * @return The best answer as bytes32
+     */
+    function getGrantQuestionBestAnswer(
+        bytes32 grantId
+    ) external view returns (bytes32) {
+        Grant storage grant = grants[grantId];
+        require(grant.recipient != address(0), "Grant does not exist");
+        return realitio.getBestAnswer(grant.questionId);
+    }
+
+    /**
+     * @dev Get the finalization timestamp for a grant's question
+     * @param grantId The grant ID
+     * @return The finalization timestamp
+     */
+    function getGrantQuestionFinalizeTS(
+        bytes32 grantId
+    ) external view returns (uint32) {
+        Grant storage grant = grants[grantId];
+        require(grant.recipient != address(0), "Grant does not exist");
+        return realitio.getFinalizeTS(grant.questionId);
+    }
+
+    /**
+     * @dev Check if a grant's question is pending arbitration
+     * @param grantId The grant ID
+     * @return True if pending arbitration
+     */
+    function isGrantQuestionPendingArbitration(
+        bytes32 grantId
+    ) external view returns (bool) {
+        Grant storage grant = grants[grantId];
+        require(grant.recipient != address(0), "Grant does not exist");
+        return realitio.isPendingArbitration(grant.questionId);
+    }
+
+    /**
+     * @dev Get the bounty for a grant's question
+     * @param grantId The grant ID
+     * @return The bounty amount
+     */
+    function getGrantQuestionBounty(
+        bytes32 grantId
+    ) external view returns (uint256) {
+        Grant storage grant = grants[grantId];
+        require(grant.recipient != address(0), "Grant does not exist");
+        return realitio.getBounty(grant.questionId);
+    }
+
+    /**
+     * @dev Get the opening timestamp for a grant's question
+     * @param grantId The grant ID
+     * @return The opening timestamp when answering begins
+     */
+    function getGrantQuestionOpeningTS(
+        bytes32 grantId
+    ) external view returns (uint32) {
+        Grant storage grant = grants[grantId];
+        require(grant.recipient != address(0), "Grant does not exist");
+        return realitio.getOpeningTS(grant.questionId);
+    }
+
+    /**
+     * @dev Get the final answer for a finalized grant question
+     * @param grantId The grant ID
+     * @return The final answer as bytes32
+     */
+    function getGrantQuestionFinalAnswer(
+        bytes32 grantId
+    ) external view returns (bytes32) {
+        Grant storage grant = grants[grantId];
+        require(grant.recipient != address(0), "Grant does not exist");
+        return realitio.getFinalAnswer(grant.questionId);
+    }
+
+    /**
+     * @dev Get comprehensive question info for a grant
+     * @param grantId The grant ID
+     * @return isFinalized True if the question is finalized
+     * @return bestAnswer The current best answer
+     * @return bond The current highest bond
+     * @return minBond The minimum bond required
+     * @return bounty The current bounty amount
+     * @return finalizeTS The finalization timestamp
+     * @return openingTS The opening timestamp
+     * @return isPendingArbitration True if pending arbitration
+     */
+    function getGrantQuestionInfo(
+        bytes32 grantId
+    )
+        external
+        view
+        returns (
+            bool isFinalized,
+            bytes32 bestAnswer,
+            uint256 bond,
+            uint256 minBond,
+            uint256 bounty,
+            uint32 finalizeTS,
+            uint32 openingTS,
+            bool isPendingArbitration
+        )
+    {
+        Grant storage grant = grants[grantId];
+        require(grant.recipient != address(0), "Grant does not exist");
+
+        bytes32 questionId = grant.questionId;
+        isFinalized = realitio.isFinalized(questionId);
+        bestAnswer = realitio.getBestAnswer(questionId);
+        bond = realitio.getBond(questionId);
+        minBond = realitio.getMinBond(questionId);
+        bounty = realitio.getBounty(questionId);
+        finalizeTS = realitio.getFinalizeTS(questionId);
+        openingTS = realitio.getOpeningTS(questionId);
+        isPendingArbitration = realitio.isPendingArbitration(questionId);
     }
 
     // ERC1155 receiver hooks to accept position tokens minted/transferred by ConditionalTokens
