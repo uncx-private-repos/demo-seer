@@ -7,11 +7,45 @@
  */
 
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.20;
+pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
 import {IConditionalTokens, IRealityETH_v3_0} from "./Interfaces.sol";
+
+/// @dev Interface for Kleros arbitrator
+interface IKlerosArbitrator {
+    function requestArbitration(
+        bytes32 questionID,
+        uint256 maxPrevious
+    ) external payable returns (uint256 disputeID);
+    function arbitrationCost(
+        bytes calldata extraData
+    ) external view returns (uint256);
+}
+
+/// @dev Interface for custom stakeholder voting arbitrator
+interface IStakeholderArbitrator {
+    function getDisputeFee(bytes32 question_id) external view returns (uint256);
+    function requestArbitration(
+        bytes32 question_id,
+        uint256 maxPrevious
+    ) external payable;
+    function realitio() external view returns (address);
+    function metadata() external view returns (string memory);
+
+    // Additional functions for stakeholder voting
+    function getVotingToken() external view returns (address);
+    function getVotingPeriod() external view returns (uint256);
+    function hasVoted(
+        bytes32 question_id,
+        address voter
+    ) external view returns (bool);
+    function getVoteCount(
+        bytes32 question_id,
+        bytes32 answer
+    ) external view returns (uint256);
+}
 
 /**
  * @title SimpleGrantManager
@@ -31,6 +65,26 @@ contract SimpleGrantManager {
 
     /// @dev Question timeout for Reality.eth
     uint32 public immutable questionTimeout;
+
+    /// @dev Minimum grant amount that triggers automatic arbitration consideration
+    uint256 public autoArbitrationThreshold;
+
+    /// @dev Kleros arbitrator contract (if using Kleros)
+    IKlerosArbitrator public klerosArbitrator;
+
+    /// @dev Stakeholder voting arbitrator contract (if using stakeholder voting)
+    IStakeholderArbitrator public stakeholderArbitrator;
+
+    /// @dev Enum to track arbitrator type
+    enum ArbitratorType {
+        Simple, // This contract acts as arbitrator
+        Kleros, // Using Kleros arbitration
+        Stakeholder, // Using stakeholder voting
+        External // Using external arbitrator contract
+    }
+
+    /// @dev Current arbitrator type
+    ArbitratorType public arbitratorType;
 
     /// @dev Template ID for boolean questions
     uint8 internal constant BOOLEAN_TEMPLATE = 0;
@@ -59,10 +113,12 @@ contract SimpleGrantManager {
         address indexed recipient,
         uint256 amount,
         bytes32 questionId,
-        bytes32 conditionId
+        bytes32 conditionId,
+        address collateralToken,
+        uint32 deadline
     );
 
-    event GrantResolved(bytes32 indexed grantId, bool success, uint256 answer);
+    event GrantResolved(bytes32 indexed grantId, bool success);
 
     event GrantRecovered(
         bytes32 indexed grantId,
@@ -91,17 +147,37 @@ contract SimpleGrantManager {
      * @param _realitio Reality.eth contract address
      * @param _arbitrator Arbitrator address for Reality.eth disputes
      * @param _questionTimeout Question timeout in seconds
+     * @param _autoArbitrationThreshold Minimum grant amount for auto-arbitration consideration
+     * @param _klerosArbitrator Kleros arbitrator contract (address(0) if not using Kleros)
+     * @param _stakeholderArbitrator Stakeholder arbitrator contract (address(0) if not using stakeholder voting)
      */
     constructor(
         IConditionalTokens _conditionalTokens,
         IRealityETH_v3_0 _realitio,
         address _arbitrator,
-        uint32 _questionTimeout
+        uint32 _questionTimeout,
+        uint256 _autoArbitrationThreshold,
+        address _klerosArbitrator,
+        address _stakeholderArbitrator
     ) {
         conditionalTokens = _conditionalTokens;
         realitio = _realitio;
         arbitrator = _arbitrator;
         questionTimeout = _questionTimeout;
+        autoArbitrationThreshold = _autoArbitrationThreshold;
+        klerosArbitrator = IKlerosArbitrator(_klerosArbitrator);
+        stakeholderArbitrator = IStakeholderArbitrator(_stakeholderArbitrator);
+
+        // Determine arbitrator type
+        if (_stakeholderArbitrator != address(0)) {
+            arbitratorType = ArbitratorType.Stakeholder;
+        } else if (_klerosArbitrator != address(0)) {
+            arbitratorType = ArbitratorType.Kleros;
+        } else if (_arbitrator == address(this)) {
+            arbitratorType = ArbitratorType.Simple;
+        } else {
+            arbitratorType = ArbitratorType.External;
+        }
     }
 
     /**
@@ -125,6 +201,7 @@ contract SimpleGrantManager {
         require(amount > 0, "Amount must be greater than 0");
         require(recipient != address(0), "Invalid recipient");
         require(deadline > block.timestamp, "Deadline must be in the future");
+        require(minBond > 0, "Minimum bond must be greater than 0");
 
         // 1. Ask Reality.eth question
         bytes32 questionId = askRealityQuestion(question, deadline, minBond);
@@ -182,7 +259,9 @@ contract SimpleGrantManager {
             recipient,
             amount,
             questionId,
-            conditionId
+            conditionId,
+            address(collateralToken),
+            deadline
         );
 
         return grantId;
@@ -244,7 +323,7 @@ contract SimpleGrantManager {
 
         grant.resolved = true;
 
-        emit GrantResolved(grantId, answer == 1, answer);
+        emit GrantResolved(grantId, answer == 1);
     }
 
     /**
@@ -480,6 +559,41 @@ contract SimpleGrantManager {
      */
     function getGrant(bytes32 grantId) external view returns (Grant memory) {
         return grants[grantId];
+    }
+
+    /**
+     * @dev Gets YES and NO token IDs for a grant
+     * @param grantId The grant ID
+     * @return yesTokenId The position ID for YES tokens
+     * @return noTokenId The position ID for NO tokens
+     */
+    function getGrantTokenIds(
+        bytes32 grantId
+    ) external view returns (uint256 yesTokenId, uint256 noTokenId) {
+        Grant storage grant = grants[grantId];
+        require(grant.recipient != address(0), "Grant does not exist");
+
+        // Calculate YES token ID
+        bytes32 yesCollectionId = conditionalTokens.getCollectionId(
+            bytes32(0),
+            grant.conditionId,
+            1 // YES outcome
+        );
+        yesTokenId = conditionalTokens.getPositionId(
+            address(grant.collateralToken),
+            yesCollectionId
+        );
+
+        // Calculate NO token ID
+        bytes32 noCollectionId = conditionalTokens.getCollectionId(
+            bytes32(0),
+            grant.conditionId,
+            2 // NO outcome
+        );
+        noTokenId = conditionalTokens.getPositionId(
+            address(grant.collateralToken),
+            noCollectionId
+        );
     }
 
     // ========== REALITY.ETH INTERACTION FUNCTIONS ==========
